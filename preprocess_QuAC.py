@@ -1,0 +1,465 @@
+import re
+import json
+import spacy
+import msgpack
+import unicodedata
+import numpy as np
+import pandas as pd
+import argparse
+import collections
+import multiprocessing
+import logging
+import random
+from allennlp.modules.elmo import batch_to_ids
+from general_utils import flatten_json, normalize_text, build_embedding, load_glove_vocab, pre_proc, get_context_span, find_answer_span, feature_gen, token2id
+
+parser = argparse.ArgumentParser(
+    description='Preprocessing train + dev files, about 20 minutes to run on Servers.'
+)
+parser.add_argument('--wv_file', default='glove/glove.840B.300d.txt',
+                    help='path to word vector file.')
+parser.add_argument('--wv_dim', type=int, default=300,
+                    help='word vector dimension.')
+parser.add_argument('--sort_all', action='store_true',
+                    help='sort the vocabulary by frequencies of all words.'
+                         'Otherwise consider question words first.')
+parser.add_argument('--threads', type=int, default=multiprocessing.cpu_count(),
+                    help='number of threads for preprocessing.')
+parser.add_argument('--no_match', action='store_true',
+                    help='do not extract the three exact matching features.')
+parser.add_argument('--seed', type=int, default=1023,
+                    help='random seed for data shuffling, embedding init, etc.')
+
+
+args = parser.parse_args()
+trn_file = 'QuAC_data/train.json'
+dev_file = 'QuAC_data/dev.json'
+wv_file = args.wv_file
+wv_dim = args.wv_dim
+nlp = spacy.load('en_core_web_sm', disable=['parser'])
+
+random.seed(args.seed)
+np.random.seed(args.seed)
+
+logging.basicConfig(format='%(asctime)s %(message)s', level=logging.DEBUG,
+                    datefmt='%m/%d/%Y %I:%M:%S')
+log = logging.getLogger(__name__)
+
+log.info('start data preparing... (using {} threads)'.format(args.threads))
+
+glove_vocab = load_glove_vocab(wv_file, wv_dim) # return a "set" of vocabulary
+log.info('glove loaded.')
+
+#===============================================================
+#=================== Work on training data =====================
+#===============================================================
+
+def proc_train(ith, article, graph_arr):
+    rows = []
+    
+    for paragraph in article['paragraphs']:
+        #就 enumerate 1次
+        context = paragraph['context']
+        node_num = len(graph_arr['nodes'])
+        # for g in graph_arr['']:
+        #     node_num += len(g['nodes'])
+
+        node_arr = []
+        assert len(graph_arr['nodes']) == len(graph_arr['edges'])
+        edge_arr = [[0 for ei in range(node_num)] for w0 in range(node_num)]
+        for node_index, node in enumerate(graph_arr['nodes']):
+            tmp_edge = graph_arr['edges'][node_index]
+
+            node_arr.append(nlp(pre_proc(node['word'])))
+
+            for ed_idx, edge in enumerate(tmp_edge):
+
+                if (edge == '' or edge == 'SELF'):
+                    continue
+                else:
+                    edge_arr[node_index][ed_idx] = 1
+        new_node_arr = node_arr
+        new_edge_arr = edge_arr
+
+        # for ei, e in enumerate(edge_arr):
+        #     if np.sum(e) == 0:
+        #         continue
+        #     else:
+        #         new_node_arr.append(node_arr[ei])
+        #         new_edge_arr.append(e)
+        # graph=dict()
+        # current_ptr=len(graph_arr)
+        # node_num=0
+        # for g in graph_arr:
+        #     node_num+=len(g['nodes'])
+        # node_arr=[]
+        # edge_arr=[[0 for ei in range(node_num)] for w0 in range(node_num)]
+        # for curr in range(current_ptr):
+        #     curr_graph=graph_arr[curr]
+        #     curr_node = curr_graph['nodes']
+        #     curr_node_num=len(curr_node)
+        #     acc_curr_node_idx=[len(node_arr)+id for id in range(curr_node_num)]
+        #     curr_edges=curr_graph['edges'] #arr[[]]
+        #     for node_detail in curr_node:
+        #         node_arr.append(nlp(pre_proc(node_detail['word'])))
+        #     for ed_idx, edge in enumerate(curr_edges):
+        #         #edge[]
+        #         acc_edge_idx=acc_curr_node_idx[ed_idx] #这个结点的实际index
+        #         for ci in range(curr_node_num):
+        #             if(edge[ci]=='' or edge[ci]=='SELF' ):
+        #                 continue
+        #             else:
+        #                 edge_arr[acc_edge_idx][acc_curr_node_idx[ci]]=1
+
+        # graph['nodes']=node_arr
+        # graph['edges'] = edge_arr
+        for qa in paragraph['qas']:
+            question = qa['question']
+            answers = qa['orig_answer']
+            
+            answer = answers['text']
+            answer_start = answers['answer_start']
+            answer_end = answers['answer_start'] + len(answers['text'])
+            answer_choice = 0 if answer == 'CANNOTANSWER' else\
+                            1 if qa['yesno'] == 'y' else\
+                            2 if qa['yesno'] == 'n' else\
+                            3 # Not a yes/no question
+            if answer_choice != 0:
+                """
+                0: Do not ask a follow up question!
+                1: Definitely ask a follow up question!
+                2: Not too important, but you can ask a follow up.
+                """
+                answer_choice += 10 * (0 if qa['followup'] == "n" else\
+                                       1 if qa['followup'] == "y" else\
+                                       2)
+            else:
+                answer_start, answer_end = -1, -1
+            rows.append((ith, question, answer, answer_start, answer_end, answer_choice)) #在列表末尾一次性追加另一个序列中的多个值（用新列表扩展原来的列表）。
+    return rows, context, new_node_arr, new_edge_arr
+tloc='train'
+train, train_context, graph_node, graph_edge = flatten_json(trn_file, proc_train, tloc)
+train = pd.DataFrame(train, columns=['context_idx', 'question', 'answer',
+                                    'answer_start', 'answer_end', 'answer_choice'])
+log.info('train json data flattened.')
+
+print(train)
+
+trC_iter = (pre_proc(c) for c in train_context)
+trQ_iter = (pre_proc(q) for q in train.question)
+
+trC_docs = [doc for doc in nlp.pipe(trC_iter, batch_size=64, n_threads=args.threads)]
+trQ_docs = [doc for doc in nlp.pipe(trQ_iter, batch_size=64, n_threads=args.threads)]
+trG_docs = graph_node
+
+def norm_node(trG_docs):
+    process=trG_docs
+    to_re=[]
+    for total_length in  process:
+        to_sub=[]
+        for partial_index in range(len(total_length)):
+            to_sub.append([normalize_text(w.text) for w in total_length[partial_index]])
+        to_re.append(to_sub)
+    return to_re
+
+# tokens
+trC_tokens = [[normalize_text(w.text) for w in doc] for doc in trC_docs]
+trQ_tokens = [[normalize_text(w.text) for w in doc] for doc in trQ_docs]
+trG_tokens =norm_node(trG_docs)
+trC_unnorm_tokens = [[w.text for w in doc] for doc in trC_docs]
+log.info('All tokens for training are obtained.')
+
+train_context_span = [get_context_span(a, b) for a, b in zip(train_context, trC_unnorm_tokens)] #每个token在原context中的位置
+
+ans_st_token_ls, ans_end_token_ls = [], []
+for ans_st, ans_end, idx in zip(train.answer_start, train.answer_end, train.context_idx):
+    ans_st_token, ans_end_token = find_answer_span(train_context_span[idx], ans_st, ans_end)
+    ans_st_token_ls.append(ans_st_token)
+    ans_end_token_ls.append(ans_end_token)
+
+train['answer_start_token'], train['answer_end_token'] = ans_st_token_ls, ans_end_token_ls
+initial_len = len(train)
+train.dropna(inplace=True) # modify self DataFrame
+log.info('drop {0}/{1} inconsistent samples.'.format(initial_len - len(train), initial_len))
+log.info('answer span for training is generated.')
+
+# features
+trC_tags, trC_ents, trC_features = feature_gen(trC_docs, train.context_idx, trQ_docs, args.no_match)
+log.info('features for training is generated: {}, {}, {}'.format(len(trC_tags), len(trC_ents), len(trC_features)))
+
+def build_train_vocab(questions, contexts): # vocabulary will also be sorted accordingly
+    if args.sort_all:
+        counter = collections.Counter(w for doc in questions + contexts for w in doc)
+        vocab = sorted([t for t in counter if t in glove_vocab], key=counter.get, reverse=True)
+    else:
+        counter_c = collections.Counter(w for doc in contexts for w in doc)
+        counter_q = collections.Counter(w for doc in questions for w in doc)
+        counter = counter_c + counter_q
+        vocab = sorted([t for t in counter_q if t in glove_vocab], key=counter_q.get, reverse=True)
+        vocab += sorted([t for t in counter_c.keys() - counter_q.keys() if t in glove_vocab],
+                        key=counter.get, reverse=True)
+    total = sum(counter.values())
+    matched = sum(counter[t] for t in vocab)
+    log.info('vocab {1}/{0} OOV {2}/{3} ({4:.4f}%)'.format(
+        len(counter), len(vocab), (total - matched), total, (total - matched) / total * 100))
+    vocab.insert(0, "<PAD>")
+    vocab.insert(1, "<UNK>")
+    vocab.insert(2, "<S>")
+    vocab.insert(3, "</S>")
+    vocab.insert(4, "<EM>")
+    vocab.insert(5, "</EM>")
+    return vocab
+
+def node_token2id(docs, vocab, unk_id=None):
+    w2id = {w: i for i, w in enumerate(vocab)}
+    to_re=[]
+    for sub_arr in docs:
+        to_sub=[]
+        for sub_idx in range(len(sub_arr)):
+            pro_arr=sub_arr[sub_idx]
+            tmp_idx=[w2id[w] if w in w2id else unk_id for w in pro_arr]
+            to_sub.append([4] +tmp_idx+ [5])
+            if(sub_idx==0):
+                print(tmp_idx)
+        to_re.append(to_sub)
+    return to_re
+
+# vocab
+tr_vocab = build_train_vocab(trQ_tokens, trC_tokens)
+trC_ids = token2id(trC_tokens, tr_vocab, unk_id=1)
+trQ_ids = token2id(trQ_tokens, tr_vocab, unk_id=1)
+trG_ids = node_token2id(trG_tokens, tr_vocab, unk_id=1)
+
+
+trQ_tokens = [["<S>"] + doc + ["</S>"] for doc in trQ_tokens]
+trQ_ids = [[2] + qsent + [3] for qsent in trQ_ids]
+print(trQ_ids[:10])
+# tags
+vocab_tag = [''] + list(nlp.tagger.labels)
+trC_tag_ids = token2id(trC_tags, vocab_tag)
+# entities
+vocab_ent = list(set([ent for sent in trC_ents for ent in sent]))
+trC_ent_ids = token2id(trC_ents, vocab_ent, unk_id=0)
+
+log.info('Found {} POS tags.'.format(len(vocab_tag)))
+log.info('Found {} entity tags: {}'.format(len(vocab_ent), vocab_ent))
+log.info('vocabulary for training is built.')
+
+tr_embedding = build_embedding(wv_file, tr_vocab, wv_dim)
+log.info('got embedding matrix for training.')
+
+# don't store row name in csv
+#train.to_csv('QuAC_data/train.csv', index=False, encoding='utf8')
+
+meta = {
+    'vocab': tr_vocab,
+    'embedding': tr_embedding.tolist()
+}
+with open('QuAC_data/train_meta.msgpack', 'wb') as f:
+    msgpack.dump(meta, f)
+
+prev_CID, first_question = -1, []  #每一个context第一个question在整个大数据中位置index
+for i, CID in enumerate(train.context_idx):
+    if not (CID == prev_CID):
+        first_question.append(i)
+    prev_CID = CID
+
+result = {
+    'question_ids': trQ_ids,
+    'context_ids': trC_ids,
+    'node_ids' : trG_ids ,
+    'edge' : graph_edge ,
+    'context_features': trC_features, # exact match, tf
+    'context_tags': trC_tag_ids, # POS tagging
+    'context_ents': trC_ent_ids, # Entity recognition
+    'context': train_context,
+    'context_span': train_context_span,
+    '1st_question': first_question,
+    'question_CID': train.context_idx.tolist(),
+    'question': train.question.tolist(),
+    'answer': train.answer.tolist(),
+    'answer_start': train.answer_start_token.tolist(),
+    'answer_end': train.answer_end_token.tolist(),
+    'answer_choice': train.answer_choice.tolist(),
+    'context_tokenized': trC_tokens,
+    'question_tokenized': trQ_tokens
+}
+with open('QuAC_data/train_data.msgpack', 'wb') as f:
+    msgpack.dump(result, f)
+
+log.info('saved training to disk.')
+
+#==========================================================
+#=================== Work on dev data =====================
+#==========================================================
+
+def proc_dev(ith, article, graph_arr):
+    rows = []
+    
+    for paragraph in article['paragraphs']:
+        context = paragraph['context']
+        # current_ptr = len(graph_arr)
+        node_num = len(graph_arr['nodes'])
+        # for g in graph_arr['']:
+        #     node_num += len(g['nodes'])
+
+        node_arr = []
+        assert len(graph_arr['nodes'])==len(graph_arr['edges'])
+        edge_arr = [[0 for ei in range(node_num)] for w0 in range(node_num)]
+        for node_index, node in enumerate(graph_arr['nodes']):
+            node_arr.append(nlp(pre_proc(node['word'])))
+            tmp_edge=graph_arr['edges'][node_index]
+            for ed_idx, edge in enumerate(tmp_edge):
+
+                if (edge == '' or edge == 'SELF'):
+                    continue
+                else:
+                    edge_arr[node_index][ed_idx] = 1
+        new_node_arr = node_arr
+        new_edge_arr = edge_arr
+        # for ei, e in enumerate(edge_arr):
+        #     if np.sum(e) == 0:
+        #         continue
+        #     else:
+        #         new_node_arr.append(node_arr[ei])
+        #         new_edge_arr.append(e)
+
+        for qa in paragraph['qas']:
+            question = qa['question']
+            answers = qa['orig_answer']
+            
+            answer = answers['text']
+            answer_start = answers['answer_start']
+            answer_end = answers['answer_start'] + len(answers['text'])
+            answer_choice = 0 if answer == 'CANNOTANSWER' else\
+                            1 if qa['yesno'] == 'y' else\
+                            2 if qa['yesno'] == 'n' else\
+                            3 # Not a yes/no question
+            if answer_choice != 0:
+                """
+                0: Do not ask a follow up question!
+                1: Definitely ask a follow up question!
+                2: Not too important, but you can ask a follow up.
+                """
+                answer_choice += 10 * (0 if qa['followup'] == "n" else\
+                                       1 if qa['followup'] == "y" else\
+                                       2)
+            else:
+                answer_start, answer_end = -1, -1
+            
+            ans_ls = []
+            for ans in qa['answers']:
+                ans_ls.append(ans['text'])
+            
+            rows.append((ith, question, answer, answer_start, answer_end, answer_choice, ans_ls))
+    return rows, context, new_node_arr, new_edge_arr
+vloc='test'
+dev, dev_context, dev_graph_node, dev_graph_edge = flatten_json(dev_file, proc_dev, vloc)
+dev = pd.DataFrame(dev, columns=['context_idx', 'question', 'answer',
+                                 'answer_start', 'answer_end', 'answer_choice', 'all_answer'])
+log.info('dev json data flattened.')
+
+print(dev)
+
+devC_iter = (pre_proc(c) for c in dev_context)
+devQ_iter = (pre_proc(q) for q in dev.question)
+devG_docs = dev_graph_node
+
+devC_docs = [doc for doc in nlp.pipe(
+    devC_iter, batch_size=64, n_threads=args.threads)]
+devQ_docs = [doc for doc in nlp.pipe(
+    devQ_iter, batch_size=64, n_threads=args.threads)]
+
+# tokens
+devC_tokens = [[normalize_text(w.text) for w in doc] for doc in devC_docs]
+devQ_tokens = [[normalize_text(w.text) for w in doc] for doc in devQ_docs]
+devC_unnorm_tokens = [[w.text for w in doc] for doc in devC_docs]
+devG_tokens =norm_node(devG_docs)
+log.info('All tokens for dev are obtained.')
+
+dev_context_span = [get_context_span(a, b) for a, b in zip(dev_context, devC_unnorm_tokens)]
+log.info('context span for dev is generated.')
+
+ans_st_token_ls, ans_end_token_ls = [], []
+for ans_st, ans_end, idx in zip(dev.answer_start, dev.answer_end, dev.context_idx):
+    ans_st_token, ans_end_token = find_answer_span(dev_context_span[idx], ans_st, ans_end)
+    ans_st_token_ls.append(ans_st_token)
+    ans_end_token_ls.append(ans_end_token)
+
+dev['answer_start_token'], dev['answer_end_token'] = ans_st_token_ls, ans_end_token_ls
+initial_len = len(dev)
+dev.dropna(inplace=True) # modify self DataFrame
+log.info('drop {0}/{1} inconsistent samples.'.format(initial_len - len(dev), initial_len))
+log.info('answer span for dev is generated.')
+
+# features
+devC_tags, devC_ents, devC_features = feature_gen(devC_docs, dev.context_idx, devQ_docs, args.no_match)
+log.info('features for dev is generated: {}, {}, {}'.format(len(devC_tags), len(devC_ents), len(devC_features)))
+
+def build_dev_vocab(questions, contexts): # most vocabulary comes from tr_vocab
+    existing_vocab = set(tr_vocab)
+    new_vocab = list(set([w for doc in questions + contexts for w in doc if w not in existing_vocab and w in glove_vocab]))
+    vocab = tr_vocab + new_vocab
+    log.info('train vocab {0}, total vocab {1}'.format(len(tr_vocab), len(vocab)))
+    return vocab
+
+# vocab
+dev_vocab = build_dev_vocab(devQ_tokens, devC_tokens) # tr_vocab is a subset of dev_vocab
+devC_ids = token2id(devC_tokens, dev_vocab, unk_id=1)
+devQ_ids = token2id(devQ_tokens, dev_vocab, unk_id=1)
+devG_ids = node_token2id(devG_tokens, dev_vocab, unk_id=1)
+
+devQ_tokens = [["<S>"] + doc + ["</S>"] for doc in devQ_tokens]
+devQ_ids = [[2] + qsent + [3] for qsent in devQ_ids]
+print(devQ_ids[:10])
+# tags
+devC_tag_ids = token2id(devC_tags, vocab_tag) # vocab_tag same as training
+# entities
+devC_ent_ids = token2id(devC_ents, vocab_ent, unk_id=0) # vocab_ent same as training
+log.info('vocabulary for dev is built.')
+
+dev_embedding = build_embedding(wv_file, dev_vocab, wv_dim)
+# tr_embedding is a submatrix of dev_embedding
+log.info('got embedding matrix for dev.')
+
+# don't store row name in csv
+#dev.to_csv('QuAC_data/dev.csv', index=False, encoding='utf8')
+
+meta = {
+    'vocab': dev_vocab,
+    'embedding': dev_embedding.tolist()
+}
+with open('QuAC_data/dev_meta.msgpack', 'wb') as f:
+    msgpack.dump(meta, f)
+
+prev_CID, first_question = -1, []
+for i, CID in enumerate(dev.context_idx):
+    if not (CID == prev_CID):
+        first_question.append(i)
+    prev_CID = CID
+
+result = {
+    'question_ids': devQ_ids,
+    'context_ids': devC_ids,
+    'node_ids' : devG_ids ,
+    'edge' : dev_graph_edge ,
+    'context_features': devC_features, # exact match, tf
+    'context_tags': devC_tag_ids, # POS tagging
+    'context_ents': devC_ent_ids, # Entity recognition
+    'context': dev_context,
+    'context_span': dev_context_span,
+    '1st_question': first_question,
+    'question_CID': dev.context_idx.tolist(),
+    'question': dev.question.tolist(),
+    'answer': dev.answer.tolist(),
+    'answer_start': dev.answer_start_token.tolist(),
+    'answer_end': dev.answer_end_token.tolist(),
+    'answer_choice': dev.answer_choice.tolist(),
+    'all_answer': dev.all_answer.tolist(),
+    'context_tokenized': devC_tokens,
+    'question_tokenized': devQ_tokens
+}
+with open('QuAC_data/dev_data.msgpack', 'wb') as f:
+    msgpack.dump(result, f)
+
+log.info('saved dev to disk.')
